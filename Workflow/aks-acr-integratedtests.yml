@@ -1,0 +1,167 @@
+name: aks-acr-integratedtests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  NOME_APLICACAO: workeracoes
+  NOME_IMAGEM: workeracoeskafka
+  PATH_PROJETO: ./WorkerAcoes
+  PATH_PROJETO_TESTES: ./WorkerAcoes.IntegrationTests
+  FILE_LOG_EXECUCAO_WORKERACOES: log-execucao-workeracoes.txt
+  AZURE_RESOURCE_GROUP_K8S: TesteKubernetes
+  AZURE_CLUSTER_K8S: AKSCluster
+  NAMESPACE_K8S: workeracoesgha
+  
+jobs:
+  tests:
+
+    runs-on: ubuntu-latest
+
+    services:
+      zookeeper:
+        image: confluentinc/cp-zookeeper:latest
+        env:
+          ZOOKEEPER_CLIENT_PORT: 2181
+          ZOOKEEPER_TICK_TIME: 2000
+        ports:
+          - 2181:2181
+      kafka:
+        image: confluentinc/cp-kafka:latest
+        env:
+          KAFKA_BROKER_ID: 1
+          KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+        ports:
+          - 9092:9092
+      mongodb:
+        image: mongo:latest
+        env:
+          MONGO_INITDB_ROOT_USERNAME: root
+          MONGO_INITDB_ROOT_PASSWORD: MongoDB2021!
+        ports:
+          - 27017:27017
+
+    env:
+      MongoDBConnection: mongodb://root:MongoDB2021!@localhost:27017
+      MongoDatabase: DBAcoesTestes
+      MongoCollection: HistoricoAcoesTestes
+      ApacheKafka__Broker: localhost:9092
+      ApacheKafka__Topic: topic-testes-acoes
+      ApacheKafka__GroupId: WorkerAcoesTestes
+
+    steps:
+    - uses: actions/checkout@v2.3.4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v1.7.2
+      with:
+        dotnet-version: 5.0.202
+
+    - name: Executar a aplicação a ser testada em background (nohup)
+      run: |
+        dotnet publish ${{ env.PATH_PROJETO }} -c Release -o app
+        cd ./app
+        sleep 20s
+        nohup dotnet WorkerAcoes.dll > ${{ env.FILE_LOG_EXECUCAO_WORKERACOES }} 2>&1 &
+
+    - name: Execução dos testes de integração
+      env:
+        IntervaloProcessamento: 4000
+      run: dotnet test ${{ env.PATH_PROJETO_TESTES }} --verbosity minimal --logger:"html;LogFileName=resultado-testes.html"
+
+    - name: Upload como Artifact do Log de Execução do Worker de Ações
+      uses: actions/upload-artifact@v2.2.3
+      if: always()
+      with:
+        name: log-execucao-workeracoes
+        path: ./app/${{ env.FILE_LOG_EXECUCAO_WORKERACOES }}
+        retention-days: 30
+
+    - name: Upload como Artifact do Report de Testes
+      uses: actions/upload-artifact@v2.2.3
+      if: always()
+      env:
+        CAMINHO_RELATORIO: ${{ env.PATH_PROJETO_TESTES }}/TestResults/resultado-testes.html
+      with:
+        name: resultado-testes
+        path: ${{ env.CAMINHO_RELATORIO }}
+        retention-days: 30
+
+  build-push-acr:
+    needs: [tests]
+    
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2.3.4
+       
+    - name: Login no Azure Container Registry
+      uses: docker/login-action@v1.8.0
+      with:
+        registry: ${{ secrets.AZURECR_REGISTRY }}
+        username: ${{ secrets.AZURECR_USERNAME }}
+        password: ${{ secrets.AZURECR_PASSWORD }}
+
+    - name: Build e Push no Azure Container Registry
+      run: |
+        cd ${{ env.PATH_PROJETO }}
+        docker build . --file Dockerfile --tag ${{ secrets.AZURECR_REGISTRY }}/${{ env.NOME_IMAGEM }}:latest
+        docker tag ${{ secrets.AZURECR_REGISTRY }}/${{ env.NOME_IMAGEM }}:latest ${{ secrets.AZURECR_REGISTRY }}/${{ env.NOME_IMAGEM }}:$GITHUB_RUN_NUMBER
+        docker push --all-tags ${{ secrets.AZURECR_REGISTRY }}/${{ env.NOME_IMAGEM }}
+
+  deployment-aks:
+    needs: [build-push-acr]
+    
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2.3.4
+
+    - name: Azure Kubernetes Service - set context - Conectando ao cluster
+      uses: Azure/aks-set-context@v1.1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }} 
+        resource-group: ${{ env.AZURE_RESOURCE_GROUP_K8S }}
+        cluster-name:  ${{ env.AZURE_CLUSTER_K8S }}
+
+    - name: Azure Kubernetes Service - Criando Secret para acesso ao Container Registry
+      uses: Azure/k8s-create-secret@v1.1
+      with:
+        namespace: ${{ env.NAMESPACE_K8S }}
+        container-registry-url: ${{ secrets.AZURECR_REGISTRY }}
+        container-registry-username: ${{ secrets.AZURECR_USERNAME }}
+        container-registry-password: ${{ secrets.AZURECR_PASSWORD }}
+        secret-name: webapp-k8s-secret
+
+    - name: Configurar manifesto de Deployment
+      run: |
+        sed -i 's/APPLICATION-NAME/${{ env.NOME_APLICACAO }}/' ./manifests/deployment.yml
+        sed -i 's/CR-DEPLOYMENT/${{ secrets.AZURECR_REGISTRY }}/' ./manifests/deployment.yml
+        sed -i 's/IMAGE-DEPLOYMENT/${{ env.NOME_IMAGEM }}/' ./manifests/deployment.yml
+        sed -i 's/TAG-DEPLOYMENT/${{ github.run_number }}/' ./manifests/deployment.yml
+    
+    - name: Azure Kubernetes Service - Deployment de Worker Service
+      uses: Azure/k8s-deploy@v1.3
+      with:
+        namespace: ${{ env.NAMESPACE_K8S }}
+        manifests: |
+          manifests/deployment.yml
+        images: |
+          '${{ secrets.AZURECR_REGISTRY }}/${{ env.NOME_IMAGEM }}:${{ github.run_number }}'
+        imagepullsecrets: |
+          webapp-k8s-secret
+          
+    - name: Registrar histórico da execução no Kubernetes
+      env:
+        HISTORICO_DEPLOYMENT: "Workflow = ${{ github.workflow }} :: Execucao = ${{ github.run_number }} :: ${{ github.event.head_commit.message }}"
+      run: kubectl annotate deployment ${{ env.NOME_APLICACAO }} kubernetes.io/change-cause="${{ env.HISTORICO_DEPLOYMENT }}" -n ${{ env.NAMESPACE_K8S }}
+
+    - name: Listar histórico de deployments no Kubernetes
+      run: kubectl rollout history deployments -n ${{ env.NAMESPACE_K8S }}
